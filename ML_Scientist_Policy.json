@@ -1,0 +1,446 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BedrockKnowledgeBaseQuery",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:Retrieve",
+        "bedrock:RetrieveAndGenerate"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "bedrock:knowledgeBaseId": "project-${uuid}-*"
+        }
+      }
+    },
+    {
+      "Sid": "BedrockKnowledgeBaseDescribe",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:GetKnowledgeBase",
+        "bedrock:ListDataSources",
+        "bedrock:GetDataSource"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "bedrock:knowledgeBaseId": "project-${uuid}-*"
+        }
+      }
+    },
+    {
+      "Sid": "BedrockKnowledgeBaseList",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:ListKnowledgeBases"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "aws:ResourceTag/Project": "project-${uuid}"
+        }
+      }
+    },
+    {
+      "Sid": "BedrockFoundationModelAccess",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:*::foundation-model/anthropic.claude-*",
+        "arn:aws:bedrock:*::foundation-model/amazon.titan-text-*",
+        "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": [
+            "us-east-1",
+            "us-west-2"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "BedrockKnowledgeBaseMetrics",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricData"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": [
+            "project-${uuid}/bedrock",
+            "project-${uuid}/knowledgebase"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "BedrockKnowledgeBaseLogging",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams"
+      ],
+      "Resource": [
+        "arn:aws:logs:*:*:log-group:/aws/lambda/project-${uuid}-*:*",
+        "arn:aws:logs:*:*:log-group:/aws/bedrock/project-${uuid}-*:*"
+      ]
+    },
+    {
+      "Sid": "BedrockKnowledgeBaseParameterAccess",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters"
+      ],
+      "Resource": [
+        "arn:aws:ssm:*:*:parameter/project-${uuid}/bedrock/*",
+        "arn:aws:ssm:*:*:parameter/project-${uuid}/knowledgebase/*"
+      ]
+    },
+    {
+      "Sid": "BedrockKnowledgeBaseSecretsAccess",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:*:*:secret:project-${uuid}-bedrock-*",
+        "arn:aws:secretsmanager:*:*:secret:project-${uuid}-kb-*"
+      ]
+    },
+    {
+      "Sid": "BedrockKnowledgeBaseS3StagingAccess",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::project-${uuid}-kb-staging",
+        "arn:aws:s3:::project-${uuid}-kb-staging/*"
+      ]
+    },
+    {
+      "Sid": "BedrockKnowledgeBaseS3DataSourceReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": [
+        "arn:aws:s3:::project-${uuid}-kb-datasource",
+        "arn:aws:s3:::project-${uuid}-kb-datasource/*"
+      ]
+    },
+    {
+      "Sid": "DenyUnauthorizedBedrockOperations",
+      "Effect": "Deny",
+      "Action": [
+        "bedrock:CreateKnowledgeBase",
+        "bedrock:DeleteKnowledgeBase",
+        "bedrock:UpdateKnowledgeBase",
+        "bedrock:CreateDataSource",
+        "bedrock:DeleteDataSource",
+        "bedrock:UpdateDataSource",
+        "bedrock:StartIngestionJob",
+        "bedrock:StopIngestionJob"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyCrossProjectBedrockAccess",
+      "Effect": "Deny",
+      "Action": [
+        "bedrock:Retrieve",
+        "bedrock:RetrieveAndGenerate",
+        "bedrock:GetKnowledgeBase"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotLike": {
+          "bedrock:knowledgeBaseId": "project-${uuid}-*"
+        }
+      }
+    },
+    {
+      "Sid": "DenyBedrockAdministrativeActions",
+      "Effect": "Deny",
+      "Action": [
+        "bedrock:PutModelInvocationLoggingConfiguration",
+        "bedrock:GetModelInvocationLoggingConfiguration",
+        "bedrock:DeleteModelInvocationLoggingConfiguration",
+        "bedrock:CreateModelCustomizationJob",
+        "bedrock:CreateProvisionedModelThroughput",
+        "bedrock:UpdateProvisionedModelThroughput",
+        "bedrock:DeleteProvisionedModelThroughput"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "LexBotManagement",
+      "Effect": "Allow",
+      "Action": [
+        "lex:CreateBot",
+        "lex:UpdateBot",
+        "lex:DeleteBot",
+        "lex:DescribeBot",
+        "lex:ListBots",
+        "lex:CreateBotVersion",
+        "lex:DescribeBotVersion",
+        "lex:ListBotVersions",
+        "lex:CreateBotAlias",
+        "lex:UpdateBotAlias",
+        "lex:DeleteBotAlias",
+        "lex:DescribeBotAlias",
+        "lex:ListBotAliases",
+        "lex:BuildBotLocale",
+        "lex:DescribeBotLocale",
+        "lex:ListBotLocales",
+        "lex:CreateBotLocale",
+        "lex:UpdateBotLocale",
+        "lex:DeleteBotLocale",
+        "lex:TagResource",
+        "lex:UntagResource",
+        "lex:ListTagsForResource"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "lex:bot-name": "project-${uuid}-*"
+        }
+      }
+    },
+    {
+      "Sid": "LexIntentAndSlotManagement",
+      "Effect": "Allow",
+      "Action": [
+        "lex:CreateIntent",
+        "lex:UpdateIntent",
+        "lex:DeleteIntent",
+        "lex:DescribeIntent",
+        "lex:ListIntents",
+        "lex:CreateSlot",
+        "lex:UpdateSlot",
+        "lex:DeleteSlot",
+        "lex:DescribeSlot",
+        "lex:ListSlots",
+        "lex:CreateSlotType",
+        "lex:UpdateSlotType",
+        "lex:DeleteSlotType",
+        "lex:DescribeSlotType",
+        "lex:ListSlotTypes",
+        "lex:CreateUploadUrl"
+      ],
+      "Resource": [
+        "arn:aws:lex:*:*:bot/project-${uuid}-*",
+        "arn:aws:lex:*:*:bot/project-${uuid}-*/*",
+        "arn:aws:lex:*:*:bot-alias/project-${uuid}-*/*",
+        "arn:aws:lex:*:*:intent/project-${uuid}-*/*",
+        "arn:aws:lex:*:*:slot-type/project-${uuid}-*/*"
+      ]
+    },
+    {
+      "Sid": "LexBotTesting",
+      "Effect": "Allow",
+      "Action": [
+        "lex:RecognizeText",
+        "lex:RecognizeUtterance",
+        "lex:StartConversation",
+        "lex:GetSession",
+        "lex:PutSession",
+        "lex:DeleteSession"
+      ],
+      "Resource": [
+        "arn:aws:lex:*:*:bot-alias/project-${uuid}-*/TSTALIASID",
+        "arn:aws:lex:*:*:bot-alias/project-${uuid}-*/DRAFT"
+      ]
+    },
+    {
+      "Sid": "LexBotImportExport",
+      "Effect": "Allow",
+      "Action": [
+        "lex:CreateExport",
+        "lex:DescribeExport",
+        "lex:ListExports",
+        "lex:CreateImport",
+        "lex:DescribeImport",
+        "lex:ListImports",
+        "lex:StartImport"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringLike": {
+          "aws:ResourceTag/Project": "project-${uuid}"
+        }
+      }
+    },
+    {
+      "Sid": "LexBotRecommendations",
+      "Effect": "Allow",
+      "Action": [
+        "lex:DescribeBotRecommendation",
+        "lex:ListBotRecommendations",
+        "lex:StartBotRecommendation",
+        "lex:StopBotRecommendation",
+        "lex:UpdateBotRecommendation"
+      ],
+      "Resource": "arn:aws:lex:*:*:bot/project-${uuid}-*"
+    },
+    {
+      "Sid": "LexLogging",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+        "logs:GetLogEvents"
+      ],
+      "Resource": [
+        "arn:aws:logs:*:*:log-group:/aws/lex/project-${uuid}-*",
+        "arn:aws:logs:*:*:log-group:/aws/lex/project-${uuid}-*:*"
+      ]
+    },
+    {
+      "Sid": "LexMetrics",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricData",
+        "cloudwatch:GetMetricStatistics",
+        "cloudwatch:ListMetrics"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": [
+            "project-${uuid}/lex",
+            "AWS/Lex"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "LexLambdaIntegration",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:GetFunction",
+        "lambda:ListFunctions",
+        "lambda:InvokeFunction"
+      ],
+      "Resource": "arn:aws:lambda:*:*:function:project-${uuid}-*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": [
+            "us-east-1",
+            "us-west-2"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "LexS3Integration",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::project-${uuid}-lex-exports",
+        "arn:aws:s3:::project-${uuid}-lex-exports/*",
+        "arn:aws:s3:::project-${uuid}-lex-imports",
+        "arn:aws:s3:::project-${uuid}-lex-imports/*"
+      ]
+    },
+    {
+      "Sid": "LexParameterStoreAccess",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "ssm:PutParameter",
+        "ssm:DeleteParameter"
+      ],
+      "Resource": [
+        "arn:aws:ssm:*:*:parameter/project-${uuid}/lex/*"
+      ]
+    },
+    {
+      "Sid": "LexSecretsAccess",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:CreateSecret",
+        "secretsmanager:UpdateSecret",
+        "secretsmanager:DeleteSecret"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:*:*:secret:project-${uuid}-lex-*"
+      ]
+    },
+    {
+      "Sid": "DenyNonProjectLexBots",
+      "Effect": "Deny",
+      "Action": [
+        "lex:*"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotLike": {
+          "lex:bot-name": "project-${uuid}-*"
+        },
+        "ForAllValues:StringNotEquals": {
+          "aws:ResourceTag/Project": "project-${uuid}"
+        }
+      }
+    },
+    {
+      "Sid": "DenyLexAdministrativeActions",
+      "Effect": "Deny",
+      "Action": [
+        "lex:CreateResourcePolicy",
+        "lex:DeleteResourcePolicy",
+        "lex:UpdateResourcePolicy",
+        "lex:DescribeResourcePolicy",
+        "lex:CreateBotChannel",
+        "lex:DeleteBotChannel",
+        "lex:UpdateBotChannel",
+        "lex:DescribeBotChannel",
+        "lex:ListBotChannelAssociations"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyCrossProjectLexAccess",
+      "Effect": "Deny",
+      "Action": [
+        "lex:RecognizeText",
+        "lex:RecognizeUtterance",
+        "lex:StartConversation",
+        "lex:GetSession",
+        "lex:PutSession",
+        "lex:DeleteSession"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotLike": {
+          "lex:bot-name": "project-${uuid}-*"
+        }
+      }
+    }
+  ]
+}
