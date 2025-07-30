@@ -1,0 +1,1679 @@
+<repo-to-text>
+Directory: Apollo.AWS.SM.Terraform
+
+Directory Structure:
+
+<content full_path="src/terraform/infrastructure/data.tf">
+data "aws_caller_identity" "current" {}
+
+data "aws_region" "current" {}
+</content>
+
+<content full_path="src/terraform/infrastructure/outputs.tf">
+output "sagemaker_domain_id" {
+  value       = aws_sagemaker_domain.sagemaker_domain.id
+  description = "The ID of the created SageMaker domain"
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/locals.tf">
+locals {
+  optum_ip_whitelist = ["168.183.0.0/16", "149.111.0.0/16", "128.35.0.0/16", "161.249.0.0/16", "198.203.174.0/23",
+    "198.203.176.0/22", "198.203.180.0/23"]
+  resource_provisioner = "UAIS"
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/main.tf">
+module "spoke_vpc" {
+  source     = "aws-ia/vpc/aws"
+  version    = "= 4.4.4"
+  name       = "${var.sagemaker_workspace_name}-vpc"
+  cidr_block = var.sagemaker_vpc.cidr_block
+  az_count   = var.sagemaker_vpc.number_azs
+  subnets = {
+    sagemaker_subnet = {
+      name_prefix = "${var.sagemaker_workspace_name}-sagemaker"
+      cidrs       = var.sagemaker_vpc.sagemaker_subnet_cidrs
+    }
+    # This might not be used now, but reserving subnets for later model endpoint deployments
+    endpoints_subnet = {
+      name_prefix = "${var.sagemaker_workspace_name}-endpoints"
+      cidrs       = var.sagemaker_vpc.endpoint_subnet_cidrs
+    }
+  }
+  tags = merge(
+    var.tags,
+    {
+      provisoner          = local.resource_provisioner
+      name                = "${var.sagemaker_workspace_name}-vpc"
+      np_ready_to_reroute = "true"
+    }
+  )
+}
+
+resource "aws_security_group" "sagemaker_sg" {
+  name        = "${var.sagemaker_workspace_name}-sagemaker_sg"
+  description = "Allow certain NFS and TCP inbound traffic"
+  vpc_id      = module.spoke_vpc.vpc_attributes.id
+
+  # restricting access from optum tower ips
+  ingress {
+    description = "TCP traffic between JupyterServer app and the KernelGateway apps"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = local.optum_ip_whitelist
+  }
+
+  ingress {
+    description = "NFS traffic over TCP on port 2049 between the domain and EFS volume"
+    from_port   = 2049
+    to_port     = 2049
+    protocol    = "tcp"
+    self        = true
+  }
+
+  ingress {
+    description = "TCP traffic between JupyterServer app and the KernelGateway apps"
+    from_port   = 8192
+    to_port     = 65535
+    protocol    = "tcp"
+    self        = true
+  }
+
+  # By default, AWS creates an ALLOW ALL egress rule when creating a new Security Group inside of a VPC.
+  # When creating a new Security Group inside a VPC, Terraform will remove this default rule,
+  # and require you specifically re-create it if you desire that rule.
+  egress {
+    description      = "Allow outbound traffic"
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1" # semantically equivalent to all ports
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  tags = merge(
+    var.tags,
+    {
+      provisoner = local.resource_provisioner
+      name       = "${var.sagemaker_workspace_name}-sagemaker_sg"
+    }
+  )
+}
+
+module "endpoints" {
+  source         = "./endpoints"
+  vpc_name       = "${var.sagemaker_workspace_name}-vpc"
+  vpc            = module.spoke_vpc
+  vpc_cidr       = module.spoke_vpc.vpc_attributes.cidr_block
+  endpoint_names = var.endpoint_names
+  tags           = merge(var.tags, { provisoner = local.resource_provisioner })
+}
+
+module "sagemaker_s3" {
+  source             = "./s3"
+  bucket_prefix      = var.sagemaker_workspace_name
+  kms_arn            = aws_kms_key.sagemaker_kms_key.arn
+  tower_ips          = local.optum_ip_whitelist
+  sagemaker_role_arn = module.sagemaker_domain_execution_role.sagemaker_role_arn
+  tags               = merge(var.tags, { provisoner = local.resource_provisioner })
+}
+
+module "sagemaker_domain_execution_role" {
+  source                   = "./iam"
+  sagemaker_workspace_name = var.sagemaker_workspace_name
+  kms_arn                  = aws_kms_key.sagemaker_kms_key.arn
+  sagemaker_bucket_arn     = module.sagemaker_s3.sagemaker_bucket_arn
+  sagemaker_subnet_ids     = values({ for k, v in module.spoke_vpc.private_subnet_attributes_by_az : split("/", k)[1] => v.id if split("/", k)[0] == "sagemaker_subnet" })
+  sagemaker_sg_ids         = [aws_security_group.sagemaker_sg.id]
+  sagemaker_ecr_arn        = aws_ecr_repository.sagemaker_aws_ecr_repository.arn
+  enable_bedrock_access    = var.enable_bedrock_access
+  tags                     = var.tags
+}
+
+resource "aws_kms_key" "sagemaker_kms_key" {
+  description         = "KMS key used to encrypt SageMaker Studio EFS & S3 Resources"
+  enable_key_rotation = true
+}
+
+resource "aws_kms_key_policy" "sagemaker_key_policy" {
+  key_id = aws_kms_key.sagemaker_kms_key.id
+  policy = jsonencode({
+    Id = "sagemaker_key_policy"
+    Statement = [
+      {
+        Action = "kms:*"
+        Effect = "Allow"
+        Principal = {
+          AWS = [
+            data.aws_caller_identity.current.account_id,
+            module.sagemaker_domain_execution_role.sagemaker_role_arn
+          ]
+        }
+        Resource = "*"
+        Sid      = "Enable IAM User Permissions"
+      },
+    ]
+    Version = "2012-10-17"
+  })
+}
+
+resource "aws_ecr_repository" "sagemaker_aws_ecr_repository" {
+  name                 = "${var.sagemaker_workspace_name}-ecr"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+  tags = merge(
+    var.tags,
+    {
+      provisoner = local.resource_provisioner
+      name       = "${var.sagemaker_workspace_name}-ecr"
+    }
+  )
+}
+
+resource "aws_sagemaker_domain" "sagemaker_domain" {
+  domain_name             = "${var.sagemaker_workspace_name}-sagemaker-domain"
+  app_network_access_type = var.app_network_access_type
+  auth_mode               = var.auth_mode
+  vpc_id                  = module.spoke_vpc.vpc_attributes.id
+  subnet_ids              = values({ for k, v in module.spoke_vpc.private_subnet_attributes_by_az : split("/", k)[1] => v.id if split("/", k)[0] == "sagemaker_subnet" })
+
+  default_space_settings {
+    execution_role = module.sagemaker_domain_execution_role.sagemaker_role_arn
+  }
+
+  default_user_settings {
+    execution_role    = module.sagemaker_domain_execution_role.sagemaker_role_arn
+    studio_web_portal = "ENABLED"
+    sharing_settings {
+      notebook_output_option = "Allowed"
+      #   s3_output_path         = "s3://${module.sagemaker_s3.sagemaker_bucket_id}/shared-notebooks"
+    }
+  }
+
+  domain_settings {
+    security_group_ids = [aws_security_group.sagemaker_sg.id, module.endpoints.endpoint_security_group]
+  }
+
+  tags = merge(
+    var.tags,
+    {
+      provisoner = local.resource_provisioner
+      name       = "${var.sagemaker_workspace_name}-sagemaker-domain"
+    }
+  )
+}
+
+resource "aws_sagemaker_user_profile" "default_user" {
+  for_each = toset(var.user_profile_names)
+
+  domain_id         = aws_sagemaker_domain.sagemaker_domain.id
+  user_profile_name = each.value
+
+  user_settings {
+    execution_role  = module.sagemaker_domain_execution_role.sagemaker_role_arn
+    security_groups = [aws_security_group.sagemaker_sg.id, module.endpoints.endpoint_security_group]
+  }
+
+  tags = merge(
+    var.tags,
+    {
+      provisoner = local.resource_provisioner
+      username   = each.value
+    }
+  )
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/variables.tf">
+variable "aws_region" {
+  description = "AWS Region."
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "sagemaker_workspace_name" {
+  description = "Name of Project"
+  type        = string
+}
+
+variable "project_id" {
+  description = "UAIS Project ID tied to the workspace"
+  type        = string
+}
+
+
+variable "sagemaker_vpc" {
+  description = "Sagemaker VPC definition."
+  type        = any
+}
+
+variable "endpoint_names" {
+  type        = list(string)
+  description = "List of VPC Endpoints Names to deploy"
+
+  default = ["sagemaker.api", "sagemaker.runtime", "sagemaker.featurestore-runtime", "sts", "ecr.dkr", "ecr.api"]
+}
+
+variable "tags" {
+  type        = map(string)
+  description = "Tags to apply to resources."
+}
+
+variable "aws_account_id" {
+  description = "AWS Account ID"
+  type        = string
+}
+
+variable "auth_mode" {
+  description = "The mode of authentication that members use to access the domain. Valid values are IAM and SSO"
+  type        = string
+  default     = "IAM"
+}
+
+variable "app_network_access_type" {
+  description = "The network access type for the App domain. Valid values are PublicInternetOnly and VpcOnly"
+  type        = string
+  default     = "VpcOnly"
+}
+
+variable "user_profile_names" {
+  type    = list(string)
+  default = ["defaultuser"] # Replace with your actual list of user profile names
+}
+
+variable "enable_bedrock_access" {
+  description = "Enable Bedrock access for the Sagemaker domain"
+  type        = bool
+  default     = false
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/provider.tf">
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+  backend "s3" {
+    access_key = ""
+    secret_key = ""
+    token = ""
+    bucket = ""
+    key = ""
+    region = ""
+  }
+}
+
+provider "aws" {
+
+#   access_key = var.aws_access_key
+#   secret_key = var.aws_secret_key
+  region     = var.aws_region
+#
+#   assume_role {
+#     role_arn = "arn:aws:iam::${var.aws_account_id}:role/uais_admin_access_role"
+#   }
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/s3/data.tf">
+data "aws_caller_identity" "current" {}
+
+data "aws_region" "current" {}
+</content>
+
+<content full_path="src/terraform/infrastructure/s3/outputs.tf">
+output "sagemaker_bucket_id" {
+  value = aws_s3_bucket.sagemaker_bucket.id
+}
+
+output "sagemaker_bucket_arn" {
+  value = aws_s3_bucket.sagemaker_bucket.arn
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/s3/main.tf">
+resource "aws_s3_bucket" "sagemaker_bucket" {
+  bucket = "${lower(var.bucket_prefix)}-sagemaker-bucket"
+  tags   = var.tags
+}
+
+resource "aws_s3_bucket_cors_configuration" "sagemaker_bucket_cors" {
+  bucket = aws_s3_bucket.sagemaker_bucket.id
+
+  cors_rule {
+    allowed_headers = ["*"]
+    allowed_methods = ["GET", "POST", "PUT", "HEAD", "DELETE"]
+    allowed_origins = ["https://*.sagemaker.aws"]
+    max_age_seconds = 3000
+    expose_headers = [
+      "ETag",
+      "x-amz-delete-marker",
+      "x-amz-id-2",
+      "x-amz-request-id",
+      "x-amz-server-side-encryption",
+      "x-amz-version-id",
+      "Access-Control-Allow-Origin"
+    ]
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "sagemaker_bucket" {
+  bucket = aws_s3_bucket.sagemaker_bucket.bucket
+  rule {
+    apply_server_side_encryption_by_default {
+      kms_master_key_id = var.kms_arn
+      sse_algorithm     = "aws:kms"
+    }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "sagemaker_bucket_life_cycle_config" {
+  bucket = aws_s3_bucket.sagemaker_bucket.id
+
+  rule {
+    id = "life-cycle-configuration-rule"
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
+    }
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_logging" "sagemaker_bucket_access_log" {
+  bucket = aws_s3_bucket.sagemaker_bucket.id
+
+  target_bucket = aws_s3_bucket.sagemaker_bucket.id
+  target_prefix = "log/"
+}
+
+resource "aws_s3_bucket_versioning" "sagemaker_bucket_versioning" {
+  bucket = aws_s3_bucket.sagemaker_bucket.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_policy" "s3_bucket_policy" {
+  bucket = aws_s3_bucket.sagemaker_bucket.id
+
+  # Deny access to s3 outside optum tower ips
+  policy = <<EOF
+ {
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": [
+          "${var.sagemaker_role_arn}"
+        ]
+      },
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:ListBucket",
+        "s3:GetBucketAcl",
+        "s3:PutObjectAcl"
+      ],
+      "Resource": [
+        "${aws_s3_bucket.sagemaker_bucket.arn}",
+        "${aws_s3_bucket.sagemaker_bucket.arn}/*"
+      ]
+    }
+  ]
+}
+EOF
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/s3/variables.tf">
+variable "tower_ips" {
+    description = "Optum Tower IPs"
+    type        = list(string)
+}
+
+variable "bucket_prefix" {
+  description = "Name of Project"
+  type        = string
+}
+
+variable "tags" {
+  type        = map(string)
+  description = "Tags to apply to resources."
+}
+
+variable "kms_arn" {
+  description = "kms key to encrypt EFS"
+  type        = string
+}
+
+variable "sagemaker_role_arn" {
+  description = "sagemaker execution role"
+  type        = string
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/endpoints/outputs.tf">
+output "endpoint_ids" {
+  value       = { for k, v in aws_vpc_endpoint.endpoint : k => v.id }
+  description = "VPC Endpoints information."
+}
+
+output "endpoint_security_group" {
+  value       = aws_security_group.endpoints_vpc_sg.id
+  description = "VPC Endpoints Security Group"
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/endpoints/main.tf">
+# Current AWS Region
+data "aws_region" "region" {}
+
+# VPC endpoints
+resource "aws_vpc_endpoint" "endpoint" {
+  for_each = toset(var.endpoint_names)
+
+  vpc_id              = var.vpc.vpc_attributes.id
+  service_name        = "com.amazonaws.${data.aws_region.region.name}.${each.value}"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = values({ for k, v in var.vpc.private_subnet_attributes_by_az : split("/", k)[1] => v.id if split("/", k)[0] == "endpoints_subnet" })
+  security_group_ids  = [aws_security_group.endpoints_vpc_sg.id]
+  private_dns_enabled = true
+  tags                = var.tags
+}
+
+# Security Group
+resource "aws_security_group" "endpoints_vpc_sg" {
+  name        = "${var.vpc_name}-endpoints-security-group"
+  description = "VPC endpoint"
+  vpc_id      = var.vpc.vpc_attributes.id
+  tags        = var.tags
+}
+
+resource "aws_vpc_security_group_ingress_rule" "allowing_ingress_https" {
+  security_group_id = aws_security_group.endpoints_vpc_sg.id
+
+  from_port   = 443
+  to_port     = 443
+  ip_protocol = "tcp"
+  cidr_ipv4   = var.vpc.vpc_attributes.cidr_block
+  tags        = var.tags
+}
+
+resource "aws_vpc_endpoint" "vpc_s3_endpoint" {
+  vpc_id            = var.vpc.vpc_attributes.id
+  service_name      = "com.amazonaws.${data.aws_region.region.name}.s3"
+  vpc_endpoint_type = "Gateway"
+  tags              = var.tags
+}
+
+resource "aws_vpc_endpoint_route_table_association" "s3_vpce_route_table_association" {
+  for_each        = var.vpc.rt_attributes_by_type_by_az.private
+  route_table_id  = each.value.id
+  vpc_endpoint_id = aws_vpc_endpoint.vpc_s3_endpoint.id
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/endpoints/variables.tf">
+variable "vpc_name" {
+  type        = string
+  description = "Name of the VPC where the EC2 instance(s) are created."
+}
+
+variable "vpc" {
+  type        = any
+  description = "VPC resources."
+}
+
+variable "vpc_cidr" {
+  type        = any
+  description = "VPC CIDR Block"
+}
+
+variable "endpoint_names" {
+  type        = list(string)
+  description = "VPC Endpoint Names"
+}
+
+variable "tags" {
+  type        = map(string)
+  description = "Tags to apply to resources."
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/iam/data.tf">
+data "aws_iam_policy" "bedrock_limited_access" {
+  name = "AmazonBedrockLimitedAccess"
+}
+
+data "aws_iam_policy" "AmazonSageMakerFullAccess" {
+  name = "AmazonSageMakerFullAccess"
+}
+
+data "aws_iam_policy" "AmazonSageMakerCanvasFullAccess" {
+  name = "AmazonSageMakerCanvasFullAccess"
+}
+
+data "aws_iam_policy" "AmazonSageMakerCanvasAIServicesAccess" {
+  name = "AmazonSageMakerCanvasAIServicesAccess"
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/iam/outputs.tf">
+output "sagemaker_role_arn" {
+  value = aws_iam_role.sagemaker_domain_default_execution_role.arn
+}
+
+output "sagemaker_role_name" {
+  value = aws_iam_role.sagemaker_domain_default_execution_role.name
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/iam/variables.tf">
+variable "sagemaker_workspace_name" {
+  description = "sagemaker workspace name"
+  type        = string
+}
+
+variable "sagemaker_bucket_arn" {
+  description = "sagemaker bucket arn"
+  type        = string
+}
+
+variable "sagemaker_ecr_arn" {
+  description = "sagemaker ecr arn"
+  type        = string
+}
+
+variable "tags" {
+  type        = map(string)
+  description = "Tags to apply to resources."
+}
+
+variable "kms_arn" {
+  description = "kms key to encrypt EFS"
+  type        = string
+}
+
+variable "sagemaker_sg_ids" {
+  description = "List of VPC security group IDs"
+  type        = list(string)
+}
+
+variable "sagemaker_subnet_ids" {
+  description = "List of VPC subnet IDs"
+  type        = list(string)
+}
+
+variable "enable_bedrock_access" {
+  description = "Enable Bedrock access for the Sagemaker domain"
+  type        = bool
+  default     = false
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/iam/iam.tf">
+data "aws_iam_policy_document" "sagemaker_domain_assume_role_policy" {
+  statement {
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["sagemaker.amazonaws.com"]
+    }
+  }
+  dynamic "statement" {
+    for_each = var.enable_bedrock_access ? [1] : []
+    content {
+      actions = ["sts:AssumeRole"]
+      principals {
+        type        = "Service"
+        identifiers = ["bedrock.amazonaws.com"]
+      }
+    }
+  }
+}
+
+resource "aws_iam_policy" "kms_policy" {
+  name        = "${var.sagemaker_workspace_name}-kms_policy"
+  path        = "/"
+  description = "KMS policy for Project: ${var.sagemaker_workspace_name}"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = [
+          "kms:Decrypt",
+          "kms:GenerateDataKey",
+          "kms:CreateGrant"
+        ]
+        Effect = "Allow"
+        Resource = [
+          var.kms_arn
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role" "sagemaker_domain_default_execution_role" {
+  name               = "${var.sagemaker_workspace_name}-sagemaker_domain_exec_role"
+  path               = "/"
+  assume_role_policy = data.aws_iam_policy_document.sagemaker_domain_assume_role_policy.json
+}
+
+# Allows access to sagemaker s3 get, put and list
+# Allows access to sagemaker ecr get, put,
+# Allows only model training and block all model deployment activities
+resource "aws_iam_policy" "sagemaker_execution_policy" {
+  name        = "${var.sagemaker_workspace_name}-SageMakerExecutionPolicy"
+  description = "Policy to allow model training in SageMaker, access to specified S3 and ECR resources"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:Get*",
+          "s3:List*",
+          "s3:Describe*",
+          "s3:DeleteObject",
+          "s3:PutObject",
+          "s3:PutObjectAcl"
+        ]
+        Resource = [
+          var.sagemaker_bucket_arn,
+          "${var.sagemaker_bucket_arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:PutImage",
+          "ecr:GetAuthorizationToken",
+          "ecr:DescribeImages"
+        ]
+        Resource = var.sagemaker_ecr_arn
+      },
+      {
+        "Sid" : "AllowPassRoleToSageMaker",
+        "Effect" : "Allow",
+        "Action" : [
+          "iam:PassRole"
+        ],
+        "Resource" : aws_iam_role.sagemaker_domain_default_execution_role.arn,
+        "Condition" : {
+          "StringEquals" : {
+            "iam:PassedToService" : "sagemaker.amazonaws.com"
+          }
+        }
+      },
+      {
+        "Sid" : "AllowVSCodeConnectivityInSageMaker",
+        "Effect" : "Allow",
+        "Action" : [
+          "sagemaker:StartSession",
+        ],
+        "Resource" : "*"
+      },
+      {
+        "Sid" : "AllowMLFlowInSageMaker",
+        "Effect" : "Allow",
+        "Action" : [
+          "sagemaker:CallMLflowAPI",
+          "sagemaker:ListExperiments",
+          "sagemaker:CreateTrackingServer",
+          "sagemaker:UpdateTrackingServer",
+          "sagemaker:DeleteTrackingServer",
+          "sagemaker:ManageTrackingServer",
+          "sagemaker:ListRuns",
+          "sagemaker:CreateExperiment",
+          "sagemaker:ListModelPackages",
+          "sagemaker:CreateModelPackage",
+          "s3:GetObject",
+          "s3:PutObject"
+        ],
+        "Resource" : "*"
+      },
+      {
+        Effect = "Deny"
+        Action = [
+          "sagemaker:CreateModel",
+          "sagemaker:CreateEndpointConfig",
+          "sagemaker:CreateEndpoint",
+          "sagemaker:UpdateEndpoint",
+          "sagemaker:DeleteModel",
+          "sagemaker:DeleteEndpointConfig",
+          "sagemaker:DeleteEndpoint"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "attach_policy" {
+  role       = aws_iam_role.sagemaker_domain_default_execution_role.name
+  policy_arn = aws_iam_policy.sagemaker_execution_policy.arn
+}
+
+# Attaching the AmazonSageMakerFullAccess policy to the SageMaker execution role
+# Model creation and deployment is blocked by the custom deny policy above
+resource "aws_iam_role_policy_attachment" "attach_sagemaker_policy" {
+  role       = aws_iam_role.sagemaker_domain_default_execution_role.name
+  policy_arn = data.aws_iam_policy.AmazonSageMakerFullAccess.arn
+}
+
+resource "aws_iam_role_policy_attachment" "attach_sagemaker_canvas_policy" {
+  role       = aws_iam_role.sagemaker_domain_default_execution_role.name
+  policy_arn = data.aws_iam_policy.AmazonSageMakerCanvasFullAccess.arn
+}
+
+resource "aws_iam_role_policy_attachment" "attach_sagemaker_canvas_services_policy" {
+  role       = aws_iam_role.sagemaker_domain_default_execution_role.name
+  policy_arn = data.aws_iam_policy.AmazonSageMakerCanvasAIServicesAccess.arn
+}
+
+resource "aws_iam_role_policy_attachment" "attach_sagemaker_kms_policy" {
+  role       = aws_iam_role.sagemaker_domain_default_execution_role.name
+  policy_arn = aws_iam_policy.kms_policy.arn
+}
+
+resource "aws_iam_role_policy_attachment" "attach_bedrock_policy" {
+  count      = var.enable_bedrock_access ? 1 : 0
+  role       = aws_iam_role.sagemaker_domain_default_execution_role.name
+  policy_arn = data.aws_iam_policy.bedrock_limited_access.arn
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/inputs/project_domain_map_sandbox.json">
+{
+  "3f3670e6-e261-410a-92ca-05c9453b6622": "d-svqk45qwiaki",
+  "46de60f5-2b31-4fb7-9cbf-b728d5b104e3": "d-wfbnu1cymsim",
+  "688b270a-5100-4560-bb30-d16688b62914": "d-mrfazqyrymar"
+}
+
+</content>
+
+<content full_path="src/terraform/infrastructure/inputs/project_domain_map.json">
+{
+  "46de60f5-2b31-4fb7-9cbf-b728d5b104e3": "d-06umthqale7l"
+}
+</content>
+
+<content full_path="src/terraform/infrastructure/inputs/workspace/982534393096_46de60f5-2b31-4fb7-9cbf-b728d5b104e3.tfvars">
+aws_region               = "us-east-1"
+aws_account_id           = "982534393096"
+sagemaker_workspace_name = "uaisworkspace"
+project_id               = "46de60f5-2b31-4fb7-9cbf-b728d5b104e3"
+
+
+sagemaker_vpc = {
+  cidr_block             = "10.93.140.0/22"
+  number_azs             = 2
+  sagemaker_subnet_cidrs = ["10.93.140.0/25", "10.93.140.128/25"]
+  endpoint_subnet_cidrs  = ["10.93.141.0/25", "10.93.141.128/25"]
+}
+
+tags = {
+  "sagemaker_workspace_name" = "uaisworkspace",
+  "project_id"               = "46de60f5-2b31-4fb7-9cbf-b728d5b104e3",
+  "customer_aide"            = "AIDE_0074310"
+  "hcp_rg"                   = "migration-aide-0074310-4416a57"
+}
+
+endpoint_names = ["ecr.api", "ecr.dkr", "logs", "ssm", "ssmmessages", "ec2messages", "sagemaker.api", "secretsmanager","sagemaker.runtime",
+  "sagemaker.featurestore-runtime", "servicecatalog", "forecast", "forecastquery", "rekognition","textract", "comprehend", "sts", "redshift-data",
+  "athena", "glue", "codewhisperer" ]
+
+</content>
+
+<content full_path="src/terraform/infrastructure/inputs/sandbox/934545599161_688b270a-5100-4560-bb30-d16688b62914.tfvars">
+aws_region               = "us-east-1"
+aws_account_id           = "934545599161"
+sagemaker_workspace_name = "uaismedqa"
+project_id               = "688b270a-5100-4560-bb30-d16688b62914"
+
+
+sagemaker_vpc = {
+  cidr_block             = "10.106.0.0/22"
+  number_azs             = 2
+  sagemaker_subnet_cidrs = ["10.106.0.0/25", "10.106.0.128/25"]
+  endpoint_subnet_cidrs  = ["10.106.1.0/25", "10.106.1.128/25"]
+}
+
+tags = {
+  "sagemaker_workspace_name" = "uaismedqa",
+  "project_id"               = "688b270a-5100-4560-bb30-d16688b62914",
+  "customer_aide"            = "AIDE_0090989",
+  "hcp_rg"                   = "medqa-initiative-c9636d3"
+}
+
+endpoint_names = ["ecr.api", "ecr.dkr", "logs", "ssm", "ssmmessages", "ec2messages", "sagemaker.api", "secretsmanager","sagemaker.runtime",
+  "sagemaker.featurestore-runtime", "servicecatalog", "forecast", "forecastquery", "rekognition","textract", "comprehend", "sts", "redshift-data",
+  "athena", "glue", "codewhisperer" ]
+
+</content>
+
+<content full_path="src/terraform/infrastructure/inputs/sandbox/952189540345_5f90a659-b2aa-40a1-9a25-91e5bd48b1d1.tfvars">
+aws_region               = "us-east-1"
+aws_account_id = "952189540345"
+sagemaker_workspace_name = "uaispocdelete"
+project_id               = "5f90a659-b2aa-40a1-9a25-91e5bd48b1d1"
+
+
+sagemaker_vpc = {
+  cidr_block             = "10.103.12.0/22"
+  number_azs             = 2
+  sagemaker_subnet_cidrs = ["10.103.12.0/25", "10.103.12.128/25"]
+  endpoint_subnet_cidrs  = ["10.103.13.0/25", "10.103.13.128/25"]
+}
+
+tags = {
+  "sagemaker_workspace_name" = "uaispocdelete",
+  "project_id"               = "5f90a659-b2aa-40a1-9a25-91e5bd48b1d1",
+  "customer_aide"            = "AIDE_0074310"
+  "hcp_rg"                   = "uais-prod-testing-3946bf8"
+}
+
+endpoint_names = ["ecr.api", "ecr.dkr", "logs", "ssm", "ssmmessages", "ec2messages", "sagemaker.api", "secretsmanager","sagemaker.runtime",
+  "sagemaker.featurestore-runtime", "servicecatalog", "forecast", "forecastquery", "rekognition","textract", "comprehend", "sts", "redshift-data",
+  "athena", "glue", "codewhisperer" ]
+
+</content>
+
+<content full_path="src/terraform/infrastructure/inputs/sandbox/952189540345_46de60f5-2b31-4fb7-9cbf-b728d5b104e3.tfvars">
+aws_region               = "us-east-1"
+aws_account_id           = "952189540345"
+sagemaker_workspace_name = "uaispocws"
+project_id               = "46de60f5-2b31-4fb7-9cbf-b728d5b104e3"
+
+
+sagemaker_vpc = {
+  cidr_block             = "10.103.8.0/22"
+  number_azs             = 2
+  sagemaker_subnet_cidrs = ["10.103.10.0/25", "10.103.10.128/25"]
+  endpoint_subnet_cidrs  = ["10.103.11.0/25", "10.103.11.128/25"]
+}
+
+tags = {
+  "sagemaker_workspace_name" = "uaispocws",
+  "project_id"               = "46de60f5-2b31-4fb7-9cbf-b728d5b104e3",
+  "customer_aide"            = "AIDE_0074310",
+  "hcp_rg"                   = "migration-aide-0074310-4416a57"
+}
+
+enable_bedrock_access = true
+
+endpoint_names = ["ecr.api", "ecr.dkr", "logs", "ssm", "ssmmessages", "ec2messages", "sagemaker.api", "secretsmanager","sagemaker.runtime",
+  "sagemaker.featurestore-runtime", "servicecatalog", "forecast", "forecastquery", "rekognition","textract", "comprehend", "sts", "redshift-data",
+  "athena", "glue", "codewhisperer" ]
+
+</content>
+
+<content full_path="src/terraform/infrastructure/inputs/sandbox/386999644377_3f3670e6-e261-410a-92ca-05c9453b6622.tfvars">
+aws_region               = "us-east-1"
+aws_account_id           = "386999644377"
+sagemaker_workspace_name = "olsnlpsandbox"
+project_id               = "3f3670e6-e261-410a-92ca-05c9453b6622"
+
+
+sagemaker_vpc = {
+  cidr_block             = "10.1.112.0/22"
+  number_azs             = 2
+  sagemaker_subnet_cidrs = ["10.1.112.0/25", "10.1.112.128/25"]
+  endpoint_subnet_cidrs  = ["10.1.113.0/25", "10.1.113.128/25"]
+}
+
+tags = {
+  "sagemaker_workspace_name" = "olsnlpsandbox",
+  "project_id"               = "3f3670e6-e261-410a-92ca-05c9453b6622",
+  "customer_aide"            = "AIDE_0074871"
+  "hcp_rg"                   = "ols-enrichment-2571545"
+}
+
+endpoint_names = ["ecr.api", "ecr.dkr", "logs", "ssm", "ssmmessages", "ec2messages", "sagemaker.api", "secretsmanager","sagemaker.runtime",
+  "sagemaker.featurestore-runtime", "servicecatalog", "forecast", "forecastquery", "rekognition","textract", "comprehend", "sts", "redshift-data",
+  "athena", "glue", "codewhisperer" ]
+
+</content>
+
+<content full_path="src/scripts/policy-creation/sample_policy.json">
+{"custom_policies":{"BedrockAccessPolicy0":{"Version":"2012-10-17","Statement":[{"Sid":"BedrockPermissions","Effect":"Allow","Action":["bedrock:InvokeModel"],"Resource":["arn:aws:bedrock:us-east-1:952189540345:*"]}]}}, "managed_policies":["arn:aws:iam::aws:policy/ReadOnlyAccess"]}
+
+</content>
+
+<content full_path="src/scripts/policy-creation/create_policy.py">
+import argparse
+import os
+import json
+import sys
+
+def main():
+    parser = argparse.ArgumentParser(description="Create policy JSON")
+    parser.add_argument('--policy-json', required=False, help='Policy JSON string')
+    parser.add_argument('--account-id', required=False, help='AWS Account ID')
+    parser.add_argument('--policy-name', required=False, help='Policy name')
+    parser.add_argument('--output-dir', required=True, help='Output directory for policy file')
+    args = parser.parse_args()
+
+    policy = json.loads(args.policy_json)
+    account_id = args.account_id
+    policy_name = args.policy_name
+
+    folder = os.path.join(args.output_dir, f"custom_policies/AWS/{account_id}")
+    os.makedirs(folder, exist_ok=True)
+    file_path = os.path.join(folder, f"{policy_name}.json")
+    with open(file_path, "w") as f:
+        json.dump(policy, f, indent=2)
+    print(f"Policy written to {file_path}")
+
+if __name__ == "__main__":
+    main()
+</content>
+
+<content full_path="src/scripts/validation-details-scripts/azureauth.py">
+import os
+
+from azure.identity import DefaultAzureCredential
+from msal import ConfidentialClientApplication
+
+
+def get_token(azure_auth_config_model):
+    app = ConfidentialClientApplication(
+        authority=azure_auth_config_model.ACCESS_TOKEN_URL,
+        client_id=azure_auth_config_model.CLIENT_ID,
+        client_credential=azure_auth_config_model.CLIENT_SECRET
+    )
+    return app.acquire_token_for_client(scopes=[azure_auth_config_model.SCOPE])
+
+
+class AzureAuthConfigModel:
+    def __init__(self, CLIENT_ID, CLIENT_SECRET, ACCESS_TOKEN_URL, SCOPE):
+        self.CLIENT_ID = CLIENT_ID
+        self.CLIENT_SECRET = CLIENT_SECRET
+        self.ACCESS_TOKEN_URL = ACCESS_TOKEN_URL
+        self.SCOPE = SCOPE
+
+def get_azure_credential_using_tf_sp():
+    AZURE_CLIENT_ID = os.environ.get('AZURE_CLIENT_ID')
+    AZURE_TENANT_ID = os.environ.get('AZURE_TENANT_ID')
+    AZURE_CLIENT_SECRET = os.environ.get('AZURE_CLIENT_SECRET')
+    return DefaultAzureCredential()
+</content>
+
+<content full_path="src/scripts/validation-details-scripts/guru.py">
+import argparse
+import traceback
+import requests
+import msal
+
+from guru_service_client.types import Response
+from guru_service_client.api.project_controller_v_2 import get_project
+from guru_service_client import AuthenticatedClient as GuruAuthenticatedClient
+from azureauth import get_token, AzureAuthConfigModel
+from guru_service_client.types import Response
+from http import HTTPStatus
+from exceptions import HttpServiceException
+import json
+import os
+
+GURU_BASE_URL = os.environ.get('GURU_BASE_URL')
+CLIENT_ID = os.environ.get('CLIENT_ID')
+CLIENT_SECRET = os.environ.get('CLIENT_SECRET')
+TENANT_ID = os.environ.get('TENANT_ID')
+
+AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+SCOPE = ["https://graph.microsoft.com/.default"]
+GRAPH_API_BASE_URL = "https://graph.microsoft.com/v1.0"
+
+def get_access_token():
+    """
+    Acquires an access token using MSAL's client credentials flow.
+    """
+    app = msal.ConfidentialClientApplication(
+        client_id=CLIENT_ID,
+        client_credential=CLIENT_SECRET,
+        authority=AUTHORITY
+    )
+
+    result = app.acquire_token_for_client(scopes=SCOPE)
+
+    if "access_token" in result:
+        return result['access_token']
+    else:
+        print(f"Error acquiring token: {result.get('error')}")
+        print(f"Description: {result.get('error_description')}")
+        print(f"Correlation ID: {result.get('correlation_id')}")
+        return None
+
+def get_group_id_by_name(access_token, group_name):
+    """
+    Fetches the Object ID of an Azure AD group given its display name.
+    """
+    if not access_token:
+        print("No access token available. Cannot search for group by name.")
+        return None
+
+    # Use $filter to find groups by displayName. The 'eq' operator is for exact match.
+    # Group display names are typically case-insensitive, but you might need to test.
+    endpoint = f"{GRAPH_API_BASE_URL}/groups?$filter=displayName eq '{group_name}'&$select=id,displayName"
+    # Note: OData filter strings need to be enclosed in single quotes.
+
+    headers = {
+        'Authorization': 'Bearer ' + access_token,
+        'Content-Type': 'application/json'
+    }
+
+    try:
+        response = requests.get(endpoint, headers=headers)
+        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+
+        data = response.json()
+        groups = data.get('value', [])
+
+        if not groups:
+            print(f"Error: No group found with the name '{group_name}'. Ensure the name is exact.")
+            return None
+        elif len(groups) > 1:
+            print(f"Warning: Multiple groups found with the name '{group_name}'.")
+            print("Please be more specific or use the exact Object ID.")
+            for group in groups:
+                print(f"  - Name: {group.get('displayName')}, ID: {group.get('id')}")
+            return None # Or you could return groups[0]['id'] if you want the first match
+        else:
+            found_group = groups[0]
+            print(f"Found group '{found_group.get('displayName')}' with ID: {found_group.get('id')}")
+            return found_group.get('id')
+    except requests.exceptions.HTTPError as err:
+        print(f"HTTP error occurred while searching for group: {err}")
+        print(f"Response: {response.text}")
+        return None
+    except requests.exceptions.RequestException as err:
+        print(f"An error occurred while searching for group: {err}")
+        return None
+
+def get_group_members(access_token, group_id):
+    """
+    Fetches members of a specific Azure AD group using Microsoft Graph API.
+    """
+    if not access_token or not group_id:
+        print("Invalid access token or group ID. Cannot fetch group members.")
+        return []
+
+    # Endpoint to get group members. We use $select to get specific properties.
+    endpoint = f"{GRAPH_API_BASE_URL}/groups/{group_id}/members?$select=id,displayName,mailNickname,mail"
+
+    headers = {
+        'Authorization': 'Bearer ' + access_token,
+        'Content-Type': 'application/json'
+    }
+
+    all_members = []
+    while endpoint:
+        try:
+            response = requests.get(endpoint, headers=headers)
+            response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+
+            data = response.json()
+            members = data.get('value', [])
+            all_members.extend(members)
+
+            # Check for pagination (Graph API often returns results in pages)
+            endpoint = data.get('@odata.nextLink')
+        except requests.exceptions.HTTPError as err:
+            print(f"HTTP error occurred: {err}")
+            print(f"Response: {response.text}")
+            break
+        except requests.exceptions.RequestException as err:
+            print(f"An error occurred: {err}")
+            break
+
+    return all_members
+
+def getGuruClient(url, **kwargs) -> GuruAuthenticatedClient:
+    CLIENT_ID = os.environ.get('BACKFILL_UAIS_CLIENT_ID')
+    CLIENT_SECRET = os.environ.get('BACKFILL_UAIS_CLIENT_SECRET')
+    ACCESS_TOKEN_URL = os.environ.get('ACCESS_TOKEN_URL')
+    GURU_SCOPE = os.environ.get('GURU_SCOPE')
+    azure_auth_config_model = AzureAuthConfigModel(CLIENT_ID, CLIENT_SECRET, ACCESS_TOKEN_URL, GURU_SCOPE)
+    result = get_token(azure_auth_config_model)
+    token = result["access_token"]
+    guru_client = GuruAuthenticatedClient(base_url=url, token=token)
+    return guru_client
+
+
+def getProject(projectId):
+    try:
+
+        print(f"Inside getProject ==== {project_id}")
+        guru_client: GuruAuthenticatedClient = getGuruClient(GURU_BASE_URL)
+        with guru_client as guru_client:
+            response : Response[ProjectResponseV2] = get_project.sync_detailed(client=guru_client,project_id=projectId, ruai=False)
+            print(response)
+        return response
+    except Exception as e:
+        print("Exception occurred while fetching the All projects list : " + str(e))
+        traceback.print_exc()
+        return None
+
+def parseInputArguments():
+    parser = argparse.ArgumentParser(description='Input details required for backfill')
+    parser.add_argument('--env', type=str, dest='ENV_NAME', help='Environment name NonProd/Prod')
+    parser.add_argument('--projectId', type=str, dest='PROJECT_ID', help='Project ID')
+    parser.add_argument('--msId', type=str, dest='MS_ID', help='MS Id')
+    return parser.parse_args()
+
+def getSecureGroupId(response : Response):
+    contributor_ad_group = response.get('contributorADGroup')
+    if contributor_ad_group:
+        return contributor_ad_group.get('groupId')
+    else:
+        return None
+
+def getSecureGroupName(response : Response):
+    contributor_ad_group = response.get('contributorADGroup')
+    if contributor_ad_group:
+        return contributor_ad_group.get('groupName')
+    else:
+        return None
+if __name__ == "__main__":
+    # logging.basicConfig(level=logging.DEBUG)
+    # Parsing Input from workflo
+
+    args = parseInputArguments()
+
+    project_id = args.PROJECT_ID
+    ms_id = args.MS_ID
+    if not project_id:
+        print("Project ID cannot be empty. Exiting.")
+    else:
+       # print(f"Fetching details for Project ID: {project_id}...")
+        project_details = getProject(project_id)
+        if project_details:
+            print("Project details fetched successfully:")
+            print(project_details)
+        else:
+            print("Failed to fetch project details or no details found.")
+
+    group_id = getSecureGroupId(json.loads(project_details.content))
+    group_name = getSecureGroupName(json.loads(project_details.content))
+    print("Attempting to acquire access token...")
+    token = get_access_token()
+
+    if token:
+        print("Access token acquired successfully.")
+        if group_id:
+            print(f"Fetching members for group '{group_name}' (ID: {group_id})...")
+            members = get_group_members(token, group_id)
+
+            is_match_found = False
+            email_id = None
+            display_Name = None
+            if members:
+                is_match_found = any(member.get('mailNickname', '').lower() == ms_id.lower() for member in members)
+
+                print(f"\nFound {len(members)} members in group '{group_name}':")
+                for member in members:
+                    print(f"  - Display Name: {member.get('displayName', 'N/A')}")
+                    print(f"    MsId: {member.get('mailNickname', 'N/A')}")
+                    print(f"    Email: {member.get('mail', 'N/A')}")
+                    print(f"    ID: {member.get('id', 'N/A')}")
+                    print("-" * 20)
+                    if member.get('mailNickname', '').lower() == ms_id.lower():
+                        email_id= member.get('mail', 'N/A')
+                        display_Name= member.get('displayName', 'N/A')
+
+            else:
+                print(f"No members found for group '{group_name}' or an error occurred while fetching members.")
+            output = {
+                "project_id": project_id,
+                "is_valid": is_match_found,
+                "group_info": {
+                    "name": group_name ,
+                    "id": group_id ,
+                    "member_count": len(members),
+                    "members": [
+                        {
+                            "displayName": member.get('displayName', 'N/A'),
+                            "MsId": member.get('mailNickname', 'N/A').replace("_",""),
+                            "email": member.get('mail', 'N/A'),
+                            "id": member.get('id', 'N/A')
+                        }
+                        for member in members
+                    ]
+                }
+            }
+            json_output = json.dumps(output)
+            print(json_output)
+#             with open(os.environ.get("GITHUB_OUTPUT", ""), "a") as f:
+#                  #   escaped_json = json_output.replace('%', '%25').replace('\n', '%0A').replace('\r', '%0D')
+#                     f.write(f"userList={json_output}")
+            # Set the output for GitHub Actions
+            with open(os.environ['GITHUB_ENV'], 'a') as f:
+                f.write(f"userList={json_output}\n")
+                f.write(f"isValid={is_match_found}\n")
+                f.write(f"emailId={email_id}\n")
+                f.write(f"displayName={display_Name}\n")
+
+        else:
+            print(f"Could not find or resolve group ID for '{group_name}'. Please check the name and try again.")
+    else:
+        print("Failed to acquire access token. Please check your Client ID, Client Secret, Tenant ID, and permissions.")
+</content>
+
+<content full_path="src/scripts/validation-details-scripts/exceptions.py">
+import attrs
+
+
+@attrs.define
+class HttpServiceException(Exception):
+    _error_code: str
+    _error_description: str
+
+    def get_error_code(self) -> str:
+        return str(self._error_code)
+
+    def get_error_desc(self) -> str:
+        if self._error_description:
+            return str(self._error_description)
+        else:
+            return ""
+</content>
+
+<content full_path="src/scripts/validation-details-scripts/group_name.py">
+import msal
+import requests
+import json
+import os
+
+
+CLIENT_ID = ""
+CLIENT_SECRET = ""
+TENANT_ID = ""
+
+AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
+SCOPE = ["https://graph.microsoft.com/.default"]
+GRAPH_API_BASE_URL = "https://graph.microsoft.com/v1.0"
+
+def get_access_token():
+    """
+    Acquires an access token using MSAL's client credentials flow.
+    """
+    app = msal.ConfidentialClientApplication(
+        client_id=CLIENT_ID,
+        client_credential=CLIENT_SECRET,
+        authority=AUTHORITY
+    )
+
+    result = app.acquire_token_for_client(scopes=SCOPE)
+
+    if "access_token" in result:
+        return result['access_token']
+    else:
+        print(f"Error acquiring token: {result.get('error')}")
+        print(f"Description: {result.get('error_description')}")
+        print(f"Correlation ID: {result.get('correlation_id')}")
+        return None
+
+def get_group_id_by_name(access_token, group_name):
+    """
+    Fetches the Object ID of an Azure AD group given its display name.
+    """
+    if not access_token:
+        print("No access token available. Cannot search for group by name.")
+        return None
+
+    # Use $filter to find groups by displayName. The 'eq' operator is for exact match.
+    # Group display names are typically case-insensitive, but you might need to test.
+    endpoint = f"{GRAPH_API_BASE_URL}/groups?$filter=displayName eq '{group_name}'&$select=id,displayName"
+    # Note: OData filter strings need to be enclosed in single quotes.
+
+    headers = {
+        'Authorization': 'Bearer ' + access_token,
+        'Content-Type': 'application/json'
+    }
+
+    try:
+        response = requests.get(endpoint, headers=headers)
+        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+
+        data = response.json()
+        groups = data.get('value', [])
+
+        if not groups:
+            print(f"Error: No group found with the name '{group_name}'. Ensure the name is exact.")
+            return None
+        elif len(groups) > 1:
+            print(f"Warning: Multiple groups found with the name '{group_name}'.")
+            print("Please be more specific or use the exact Object ID.")
+            for group in groups:
+                print(f"  - Name: {group.get('displayName')}, ID: {group.get('id')}")
+            return None # Or you could return groups[0]['id'] if you want the first match
+        else:
+            found_group = groups[0]
+            print(f"Found group '{found_group.get('displayName')}' with ID: {found_group.get('id')}")
+            return found_group.get('id')
+    except requests.exceptions.HTTPError as err:
+        print(f"HTTP error occurred while searching for group: {err}")
+        print(f"Response: {response.text}")
+        return None
+    except requests.exceptions.RequestException as err:
+        print(f"An error occurred while searching for group: {err}")
+        return None
+
+def get_group_members(access_token, group_id):
+    """
+    Fetches members of a specific Azure AD group using Microsoft Graph API.
+    """
+    if not access_token or not group_id:
+        print("Invalid access token or group ID. Cannot fetch group members.")
+        return []
+
+    # Endpoint to get group members. We use $select to get specific properties.
+    endpoint = f"{GRAPH_API_BASE_URL}/groups/{group_id}/members?$select=id,displayName,userPrincipalName,mail"
+
+    headers = {
+        'Authorization': 'Bearer ' + access_token,
+        'Content-Type': 'application/json'
+    }
+
+    all_members = []
+    while endpoint:
+        try:
+            response = requests.get(endpoint, headers=headers)
+            response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+
+            data = response.json()
+            members = data.get('value', [])
+            all_members.extend(members)
+
+            # Check for pagination (Graph API often returns results in pages)
+            endpoint = data.get('@odata.nextLink')
+        except requests.exceptions.HTTPError as err:
+            print(f"HTTP error occurred: {err}")
+            print(f"Response: {response.text}")
+            break
+        except requests.exceptions.RequestException as err:
+            print(f"An error occurred: {err}")
+            break
+
+    return all_members
+
+def main():
+    # --- User Input ---
+    # You can hardcode this for testing, but typically you'd prompt or pass as argument
+    group_name = input("Enter the Azure AD Group Name: ")
+    if not group_name:
+        print("Group name cannot be empty. Exiting.")
+        return
+
+    print("Attempting to acquire access token...")
+    token = get_access_token()
+
+    if token:
+        print("Access token acquired successfully.")
+        print(f"Searching for group ID for '{group_name}'...")
+        group_id = get_group_id_by_name(token, group_name)
+
+        if group_id:
+            print(f"Fetching members for group '{group_name}' (ID: {group_id})...")
+            members = get_group_members(token, group_id)
+
+            if members:
+                print(f"\nFound {len(members)} members in group '{group_name}':")
+                for member in members:
+                    print(f"  - Display Name: {member.get('displayName', 'N/A')}")
+                    print(f"    UPN: {member.get('userPrincipalName', 'N/A')}")
+                    print(f"    Email: {member.get('mail', 'N/A')}")
+                    print(f"    ID: {member.get('id', 'N/A')}")
+                    print("-" * 20)
+            else:
+                print(f"No members found for group '{group_name}' or an error occurred while fetching members.")
+        else:
+            print(f"Could not find or resolve group ID for '{group_name}'. Please check the name and try again.")
+    else:
+        print("Failed to acquire access token. Please check your Client ID, Client Secret, Tenant ID, and permissions.")
+
+if __name__ == "__main__":
+    main()
+</content>
+
+<content full_path="src/scripts/sage-maker-scripts/sage_maker_presigned_url.sh">
+#!/bin/bash
+# This script returns the presigned url for opening the SageMaker Studio for the give domain id, user_profile
+
+#Run the script as below
+#sh sage_maker_presigned_url.sh domain_name sagemaker_user
+
+#params
+domain_id=$1
+user_profile=$2
+
+#aws cli commands
+aws sagemaker create-presigned-domain-url --domain-id "${domain_id}" --user-profile-name "${user_profile}" --expires-in-seconds 240 --session-expiration-duration-in-seconds 28800 --region "us-east-1"
+EXPIRED_TIMESTAMP=$(date -d "+4 minutes" +%s)
+EXPIRED_TIME=$(date -d @"$EXPIRED_TIMESTAMP" "+%Y-%m-%d %H:%M:%S")
+echo "EXPIRED_TIME=$EXPIRED_TIME" >> $GITHUB_ENV
+</content>
+
+<content full_path="src/scripts/sage-maker-scripts/ecr_push.sh">
+#!/bin/bash
+# This script pushes the given docker image to aws ecr
+
+#Run this script as below
+#sh ecr_push.sh aws_account_id docker_image_id ecr_repository_name
+
+#params
+aws_account_id=$1
+docker_image_id=$2
+repository_name=$3
+profile_name=$4
+
+#aws cli command
+aws ecr get-login-password --region "us-east-1" --profile ${profile_name} | docker login --username AWS --password-stdin "${aws_account_id}.dkr.ecr.us-east-1.amazonaws.com"
+#docker tag command
+# shellcheck disable=SC1073
+docker tag "${docker_image_id}" "${aws_account_id}.dkr.ecr.us-east-1.amazonaws.com/${repository_name}:latest"
+#docker push command
+docker push "${aws_account_id}.dkr.ecr.us-east-1.amazonaws.com/${repository_name}:latest"
+
+
+</content>
+
+<content full_path="src/scripts/sage-maker-scripts/s3_push.sh">
+#!/bin/bash
+# This script pushes the given docker image to S3 Bucket
+
+#Run this script as below
+#sh s3_push.sh local_artifact_path bucket_name target_path profile_name
+
+#params
+source_file_path=$1
+bucket_name=$2
+profile_name=$3
+
+#aws cli commands
+
+#Copy the given file to S3 Bucket
+aws s3 cp "${source_file_path}" "s3://${bucket_name}" --profile "${profile_name}"
+</content>
+
+<content full_path="src/scripts/sage-maker-scripts/cleanup.sh">
+#!/bin/bash
+set -euo pipefail
+
+# Usage check
+if [[ $# -ne 2 ]]; then
+  echo "Usage: $0 <path_to_tfvars_file> <aws_region>"
+  exit 1
+fi
+
+TFVARS_FILE="$1"
+REGION="$2"
+
+if [[ ! -f "$TFVARS_FILE" ]]; then
+  echo "Error: tfvars file '$TFVARS_FILE' not found."
+  exit 1
+fi
+
+echo "Extracting CIDRs from tfvars file: $TFVARS_FILE"
+echo "Region: $REGION"
+
+# Extract SageMaker subnet CIDRs
+cidrs=$(awk '/sagemaker_subnet_cidrs/,/]/' "$TFVARS_FILE" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+')
+
+if [[ -z "$cidrs" ]]; then
+  echo "No CIDRs found in tfvars file."
+  exit 1
+fi
+
+echo "Extracted CIDRs:"
+for cidr in $cidrs; do
+  echo "  - $cidr"
+done
+
+subnet_ids=()
+for cidr in $cidrs; do
+  id=$(aws ec2 describe-subnets \
+    --filters Name=cidr-block,Values="$cidr" \
+    --query "Subnets[*].SubnetId" \
+    --output text \
+    --region "$REGION") || true
+
+  if [[ -n "$id" ]]; then
+    subnet_ids+=($id)
+  fi
+done
+
+if [[ ${#subnet_ids[@]} -eq 0 ]]; then
+  echo "No subnets found for the given CIDRs."
+else
+  echo "Found Subnet IDs: ${subnet_ids[*]}"
+fi
+
+# Delete ENIs in those subnets
+for subnet in "${subnet_ids[@]}"; do
+  enis=$(aws ec2 describe-network-interfaces \
+    --filters Name=subnet-id,Values="$subnet" \
+              Name=status,Values=available \
+    --query "NetworkInterfaces[*].NetworkInterfaceId" \
+    --output text \
+    --region "$REGION") || true
+
+  for eni in $enis; do
+    echo "Deleting ENI: $eni"
+    aws ec2 delete-network-interface --network-interface-id "$eni" --region "$REGION" || echo "Failed to delete ENI: $eni"
+  done
+done
+# Delete EFS mount targets in those subnets
+
+  # Get all EFS file systems in the region
+  fs_ids=$(aws efs describe-file-systems \
+    --query "FileSystems[*].FileSystemId" \
+    --output text \
+    --region "$REGION") || true
+
+  for fs in $fs_ids; do
+    # Get mount targets for this file system
+    mounts=$(aws efs describe-mount-targets \
+      --file-system-id "$fs" \
+      --query "MountTargets[*].[MountTargetId,SubnetId]" \
+      --output text \
+      --region "$REGION") || true
+
+    # Read each mount target and check if it's in one of the target subnets
+    while read -r mt_id subnet_id; do
+      for target_subnet in "${subnet_ids[@]}"; do
+        if [[ "$subnet_id" == "$target_subnet" ]]; then
+          echo "Deleting EFS mount target: $mt_id in subnet: $subnet_id"
+          aws efs delete-mount-target \
+            --mount-target-id "$mt_id" \
+            --region "$REGION" || echo "Failed to delete mount target: $mt_id"
+        fi
+      done
+    done <<< "$mounts"
+  done
+
+echo "Cleanup complete for ENIs and EFS mount targets."
+
+# Extract VPC CIDR block
+vpc_cidr=$(awk '/cidr_block/ && !/sagemaker/ {gsub(/[",]/, "", $3); print $3; exit}' "$TFVARS_FILE")
+
+if [[ -z "$vpc_cidr" ]]; then
+  echo "VPC CIDR block not found in tfvars file."
+  exit 1
+fi
+
+echo "VPC CIDR Block: $vpc_cidr"
+
+# Get VPC ID
+vpc_id=$(aws ec2 describe-vpcs \
+  --filters Name=cidr-block,Values="$vpc_cidr" \
+  --query "Vpcs[*].VpcId" \
+  --output text \
+  --region "$REGION") || true
+
+if [[ -z "$vpc_id" ]]; then
+  echo "VPC not found for CIDR: $vpc_cidr"
+  exit 1
+fi
+
+echo "VPC ID: $vpc_id"
+
+# Get all non-default security groups in the VPC
+sg_ids=$(aws ec2 describe-security-groups \
+  --filters Name=vpc-id,Values="$vpc_id" \
+  --query "SecurityGroups[?GroupName!='default'].GroupId" \
+  --output text \
+  --region "$REGION") || true
+
+if [[ -z "$sg_ids" ]]; then
+  echo "No non-default security groups found."
+else
+  echo "Non-default Security Groups in VPC: $sg_ids"
+fi
+
+# Revoke all rules for all SGs
+for sg in $sg_ids; do
+  echo "Processing security group: $sg"
+
+  rule_ids=$(aws ec2 describe-security-group-rules \
+    --filters Name=group-id,Values="$sg" \
+    --query "SecurityGroupRules[*].SecurityGroupRuleId" \
+    --output text \
+    --region "$REGION") || true
+
+  for rule_id in $rule_ids; do
+    echo "Revoking rule: $rule_id"
+    aws ec2 revoke-security-group-ingress --group-id "$sg" \
+      --security-group-rule-ids "$rule_id" --region "$REGION" 2>/dev/null || \
+    aws ec2 revoke-security-group-egress --group-id "$sg" \
+      --security-group-rule-ids "$rule_id" --region "$REGION" || \
+    echo "Failed to revoke rule $rule_id"
+  done
+done
+
+# Delete SGs
+for sg in $sg_ids; do
+  echo "Attempting to delete security group: $sg"
+  aws ec2 delete-security-group --group-id "$sg" --region "$REGION" || echo "Failed to delete $sg (may still be in use)"
+done
+
+echo "Cleanup complete. You can now run 'terraform destroy' to delete the VPC."
+
+</content>
+
+</repo-to-text>
